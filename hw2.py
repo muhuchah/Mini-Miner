@@ -41,7 +41,7 @@ DBG_MINER_PROGRESS = False
 DBG_MINER_SUBMIT = False
 DBG_DIFFICULTY = False
 DBG_REJECTS = False
-DBG_SELFISH = True  # Enable selfish mining debug output
+DBG_SELFISH = False  # Enable selfish mining debug output
 
 MINER_PROGRESS_EVERY_NONCES = 50000
 MINER_PROGRESS_EVERY_SEC = 2.0
@@ -307,12 +307,19 @@ class SelfishMiner:
             return 0
         return len(self.state.private_chain)
 
-    def mine_private_block(self, parent_hash: str, difficulty: float) -> Block:
-        """Mine a block for the private chain"""
+    def mine_private_block(self, parent_hash: str, difficulty: float) -> Optional[Block]:
+        """Mine a block for the private chain - non-blocking version"""
         body = f"selfish:{self.miner_id}:{now_ms()}:{self.rand.randint(0, 1<<30)}"
-        nonce = 0
         
-        while self.running.is_set():
+        # Try a limited number of nonces per call to avoid blocking
+        max_attempts = 1000
+        start_nonce = self.rand.randint(0, 1000000)
+        
+        for nonce_offset in range(max_attempts):
+            if not self.running.is_set():
+                return None
+                
+            nonce = start_nonce + nonce_offset
             b = Block(
                 parent=parent_hash,
                 body=body,
@@ -325,11 +332,8 @@ class SelfishMiner:
             if hash_meets_difficulty(b.block_hash, difficulty):
                 self.blocks_mined += 1
                 return b
-            
-            nonce += 1
-            # Small delay to simulate hash computation
-            time.sleep(0.0001)
         
+        # Return None if no solution found in this batch - will retry next call
         return None
 
     def handle_public_block(self, public_height: int):
@@ -338,12 +342,14 @@ class SelfishMiner:
         Implements the selfish mining response strategy.
         """
         private_height = self.get_private_height()
-        self.state.lead = private_height - public_height
+        # Calculate lead but ensure it doesn't go negative
+        new_lead = private_height - public_height
+        old_lead = self.state.lead
         
         selfish_print(f"[{self.miner_id}] Public block found! Private height={private_height}, "
-                     f"Public height={public_height}, Lead={self.state.lead}")
+                     f"Public height={public_height}, Old Lead={old_lead}, New Lead={new_lead}")
         
-        if self.state.lead >= 2:
+        if new_lead >= 2:
             # Publish one block to reduce lead to 1
             selfish_print(f"[{self.miner_id}] Lead >= 2, publishing one block")
             if self.state.private_chain and len(self.published_hashes) < len(self.state.private_chain):
@@ -352,8 +358,9 @@ class SelfishMiner:
                 self.network.submit_block_from_selfish(block_to_publish)
                 self.published_hashes.add(block_to_publish.block_hash)
                 self.blocks_published += 1
+                self.state.lead = new_lead
                 
-        elif self.state.lead == 1:
+        elif new_lead == 1:
             # Publish entire private chain
             selfish_print(f"[{self.miner_id}] Lead == 1, publishing entire private chain")
             for block in self.state.private_chain:
@@ -361,54 +368,73 @@ class SelfishMiner:
                     self.network.submit_block_from_selfish(block)
                     self.published_hashes.add(block.block_hash)
                     self.blocks_published += 1
+            self.state.lead = new_lead
                     
-        elif self.state.lead <= 0:
+        elif new_lead <= 0:
             # Adopt public chain, clear private chain
             selfish_print(f"[{self.miner_id}] Lead <= 0, adopting public chain")
             self.state.private_chain = []
             self.state.private_tip = None
             self.published_hashes = set()
+            self.state.lead = 0  # Reset lead to 0, not negative
 
     def on_find_private_block(self, block: Block):
         """Called when selfish miner finds a new private block"""
         self.state.private_chain.append(block)
         self.state.private_tip = block.block_hash
-        self.state.lead = self.get_private_height()  # Assume public hasn't advanced
         
-        selfish_print(f"[{self.miner_id}] Found private block! Height={self.get_private_height()}, "
-                     f"Hash={block.block_hash[:16]}...")
+        # Calculate lead properly - only count unpublished blocks as advantage
+        private_height = self.get_private_height()
+        # Get current public height
+        public_tip, public_height = self.network.blockchain.get_tip()
         
-        # If lead becomes 2, publish one block
-        if self.state.lead == 2 and len(self.published_hashes) == 1:
+        # Lead is the difference between private and public height
+        # But we should track it relative to what we've published
+        new_lead = private_height - public_height
+        
+        # Ensure lead doesn't go negative (shouldn't happen when we find a block, but be safe)
+        if new_lead < 0:
+            new_lead = 0
+            
+        self.state.lead = new_lead
+        
+        selfish_print(f"[{self.miner_id}] Found private block! Height={private_height}, "
+                     f"Public height={public_height}, Lead={new_lead}")
+        
+        # If lead becomes 2, publish one block (from the paper's strategy)
+        if self.state.lead == 2 and len(self.published_hashes) < len(self.state.private_chain):
             selfish_print(f"[{self.miner_id}] Lead became 2, publishing first block")
-            if self.state.private_chain:
-                block_to_publish = self.state.private_chain[0]
-                self.network.submit_block_from_selfish(block_to_publish)
-                self.published_hashes.add(block_to_publish.block_hash)
-                self.blocks_published += 1
+            block_to_publish = self.state.private_chain[0]
+            self.network.submit_block_from_selfish(block_to_publish)
+            self.published_hashes.add(block_to_publish.block_hash)
+            self.blocks_published += 1
 
     def run_mining_loop(self, per_hash_delay: float = 0.001):
         """Main mining loop for selfish miner"""
         while self.running.is_set():
             # Determine what to mine on
-            if self.state.private_chain:
+            if self.state.private_chain and self.state.private_tip in self.network.blockchain.blocks:
                 parent_hash = self.state.private_tip
             else:
-                # Mine on top of public tip initially
+                # Mine on top of public tip
                 public_tip, _ = self.network.blockchain.get_tip()
                 parent_hash = public_tip
+            
+            # Verify parent exists before getting difficulty
+            if parent_hash not in self.network.blockchain.blocks:
+                # Fallback to genesis if something went wrong
+                parent_hash = self.network.blockchain.genesis_hash
             
             # Get current difficulty
             difficulty = self.network.blockchain.next_difficulty(parent_hash)
             
-            # Mine a block
+            # Mine a block (mine_private_block handles the timing internally)
             block = self.mine_private_block(parent_hash, difficulty)
             
             if block and self.running.is_set():
                 self.on_find_private_block(block)
             
-            # Small pause between blocks
-            time.sleep(0.01)
+            # No additional pause needed - mine_private_block already has timing
 
 
 class HonestMiner(threading.Thread):
@@ -440,6 +466,12 @@ class HonestMiner(threading.Thread):
         while self.running.is_set():
             parent = self.local_tip_hash
             parent_h = self.local_tip_height
+            
+            # Verify parent exists
+            if parent not in self.network.blockchain.blocks:
+                parent = self.network.blockchain.genesis_hash
+                parent_h = 0
+            
             difficulty = self.network.blockchain.next_difficulty(parent)
 
             body = f"honest:{self.miner_id}:{now_ms()}:{self.rand.randint(0, 1<<30)}"
