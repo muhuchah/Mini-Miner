@@ -343,7 +343,7 @@ class SelfishMiner:
         """
         private_height = self.get_private_height()
         # Calculate lead but ensure it doesn't go negative
-        new_lead = private_height - public_height
+        new_lead = max(0, private_height - public_height)
         old_lead = self.state.lead
         
         selfish_print(f"[{self.miner_id}] Public block found! Private height={private_height}, "
@@ -358,7 +358,7 @@ class SelfishMiner:
                 self.network.submit_block_from_selfish(block_to_publish)
                 self.published_hashes.add(block_to_publish.block_hash)
                 self.blocks_published += 1
-                self.state.lead = new_lead
+                self.state.lead = max(0, new_lead - 1)
                 
         elif new_lead == 1:
             # Publish entire private chain
@@ -368,7 +368,7 @@ class SelfishMiner:
                     self.network.submit_block_from_selfish(block)
                     self.published_hashes.add(block.block_hash)
                     self.blocks_published += 1
-            self.state.lead = new_lead
+            self.state.lead = 0
                     
         elif new_lead <= 0:
             # Adopt public chain, clear private chain
@@ -434,7 +434,8 @@ class SelfishMiner:
             if block and self.running.is_set():
                 self.on_find_private_block(block)
             
-            # No additional pause needed - mine_private_block already has timing
+            # Add small pause to prevent CPU spinning
+            time.sleep(0.001)
 
 
 class HonestMiner(threading.Thread):
